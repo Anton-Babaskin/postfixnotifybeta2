@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Interactive installer for Postfix → Telegram notifier (new, improved)
+
+# must run as root
+if [[ $EUID -ne 0 ]]; then
+  echo "Error: run as root"
+  exit 1
+fi
+
+# Check dependencies
+for cmd in git bash curl jq systemctl; do
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "Error: $cmd is required. Install it first."
+    exit 1
+  fi
+done
+
+# Prompt for credentials
+read -rp "Enter your Telegram Bot Token: " BOT_TOKEN
+[[ -n $BOT_TOKEN ]] || { echo "Error: Bot Token cannot be empty"; exit 1; }
+read -rp "Enter your Telegram Chat ID: " CHAT_ID
+[[ -n $CHAT_ID ]] || { echo "Error: Chat ID cannot be empty"; exit 1; }
+
+# Paths
+BIN=/usr/local/bin
+SERVICE=/etc/systemd/system/postfix-telegram-notify.service
+
+# 1) helper
+cat > "$BIN/telegram_notify.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+BOT_TOKEN="$BOT_TOKEN"
+CHAT_ID="$CHAT_ID"
+send_telegram(){
+  local msg="\$1"
+  curl -fsSL --retry 3 --max-time 10 \
+    --data-urlencode "chat_id=\$CHAT_ID" \
+    --data-urlencode "text=\$msg" \
+    "https://api.telegram.org/bot\$BOT_TOKEN/sendMessage" \
+    || echo "\$(date) [WARN] failed to send: \${msg//$'\n'/ }" >&2
+}
+EOF
+chmod 755 "$BIN/telegram_notify.sh"
+
+# 2) daemon script
+cat > "$BIN/postfix-telegram-notify.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /usr/local/bin/telegram_notify.sh
+
+LOG=/var/log/mail.log
+HOST=$(hostname -f)
+
+# follow
+tail -F "$LOG" | while read -r line; do
+  ts=$(echo "$line" | cut -d' ' -f1-3)
+  if [[ "$line" =~ postfix/(smtp|local|lmtp|bounce) ]] && \
+     { [[ "$line" =~ status=(bounced|deferred) ]] || [[ "$line" =~ NOQUEUE:\ reject: ]]; }; then
+
+    if [[ "$line" =~ NOQUEUE:\ reject: ]]; then
+      to=$(grep -oP 'to=<\K[^>]+' <<<"$line" || echo "N/A")
+      reason=$(sed -n 's/.*reject: \(.*\)/\1/p' <<<"$line" || echo "N/A")
+      msg="⛔ Rejected @ $HOST\nTime: $ts\nTo: $to\nReason: $reason"
+    else
+      id=$(grep -oP '\b[0-9A-F]{10,}\b' <<<"$line" || echo "N/A")
+      to=$(grep -oP 'to=<\K[^>]+' <<<"$line" || echo "N/A")
+      st=$(grep -oP 'status=\K[^ ]+' <<<"$line" || echo "N/A")
+      msg="⚠️ Delivery issue @ $HOST\nTime: $ts\nQueueID: $id\nTo: $to\nStatus: $st"
+    fi
+
+    send_telegram "$msg"
+  fi
+done
+EOF
+chmod 755 "$BIN/postfix-telegram-notify.sh"
+
+# 3) systemd unit
+cat > "$SERVICE" <<EOF
+[Unit]
+Description=Postfix Telegram Notify Daemon
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=$BIN/postfix-telegram-notify.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 4) enable and start
+systemctl daemon-reload
+systemctl enable --now postfix-telegram-notify.service
+
+echo "✅ Installed and running."
+echo "Check with: systemctl status postfix-telegram-notify.service"
